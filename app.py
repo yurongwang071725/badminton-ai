@@ -21,7 +21,7 @@ import streamlit as st
 import mediapipe as mp
 
 # ============ 页面配置 ============
-st.set_page_config(page_title="羽毛球高远球智能教学系统", page_icon="🏸", layout="wide")
+st.set_page_config(page_title="羽毛球高远球智能教学系统", page_icon="羽毛球", layout="wide")
 
 # ============ 界面美化 CSS ============
 st.markdown(
@@ -74,6 +74,21 @@ ACTION_PROFILES = {
         "ideal": {
             "elbow_peak": (120, 160), "swing_speed": 200,
             "post_rise": 0.04,
+        },
+    },
+    "net": {     # 搓球/放网（网前轻技术，合并为一类评价）
+        "name": "搓球/放网", "emoji": "🎾",
+        "ideal": {
+            "elbow_peak": (110, 160), "shoulder_peak": (80, 130),
+            "swing_speed": 120, "swing_speed_max": 280,
+            # 网前技术击球点天然低于肩：不设 impact_lift 下限，见 score_and_feedback 特殊分支
+        },
+    },
+    "around_head": {  # 头顶球（头顶区被动过渡）
+        "name": "头顶球", "emoji": "🌀",
+        "ideal": {
+            "elbow_peak": (150, 175), "shoulder_peak": (140, 175),
+            "swing_speed": 320, "impact_lift": 0.03,
         },
     },
 }
@@ -368,9 +383,10 @@ def draw_annotated(frame_bgr, landmarks, angles, side="right"):
 
 
 # ============ 核心分析 ============
-def analyze_video(video_bytes, label=""):
+def analyze_video(video_bytes, label="", force_action=None):
     """逐帧姿态估计。返回 dict：
-    jpgs(标注帧) elbow/shoulder(角度序列) impact(击球帧索引) fps 及派生指标"""
+    jpgs(标注帧) elbow/shoulder(角度序列) impact(击球帧索引) fps 及派生指标
+    force_action: "clear"/"drop"/"smash"/"lift"/None（None 表示自动分类）"""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
         tmp = f.name
@@ -436,7 +452,7 @@ def analyze_video(video_bytes, label=""):
         m = segment_metrics(series, wy, sh, imp, dt)
         if m is None:
             continue
-        m["action"] = classify_action(m)
+        m["action"] = classify_action(m, force=force_action)
         segments.append(m)
 
     if not segments:
@@ -505,6 +521,7 @@ def segment_metrics(series, wy, sh, impact, dt):
 
     m = {
         "impact": impact, "win_lo": lo, "win_hi": hi,
+        "win_frames": len(elbow_win),  # 动作片段帧数（时长代理）
         "swing_speed": (max(diffs) / dt) if diffs else 0.0,
         "impact_lift": float(sh.iloc[impact] - wy.iloc[impact]),
         "post_move": float(wy.iloc[p_hi] - wy.iloc[p_lo]) if p_hi > p_lo else 0.0,
@@ -516,25 +533,124 @@ def segment_metrics(series, wy, sh, impact, dt):
         m[k] = win
         m["peak_" + k] = float(max(win))
         m["min_" + k] = float(min(win))
+    # 腕部制动时刻：击球后手腕最早就停止上升的偏移量
+    wrist_eff = []
+    for k in range(p_lo, p_hi):
+        if pd.notna(wy.iloc[k]) and pd.notna(wy.iloc[k + 1]):
+            wrist_eff.append(float(wy.iloc[k + 1] - wy.iloc[k]))  # 负=继续上升
+    m["wrist_brake"] = wrist_eff
     return m
 
 
-def classify_action(a):
-    """动作分类决策树（基于运动学特征，MediaPipe y 轴向下为正）：
-    1) 击球点远高于肩 + 挥速极快 → 杀球
-    2) 击球后手腕仍持续上升（y 减小，post_move<0）→ 挑球（下手位向上发力）
-    3) 挥速慢 → 吊球（减力切削）
-    4) 其余 → 高远球兜底（本项目主动作）"""
-    lift, spd = a["impact_lift"], a["swing_speed"]
-    post = a["post_move"]
+def classify_action(a, force=None):
+    """动作分类 — 多特征加权投票（v4.2，支持 6 类动作）
 
-    if lift > 0.12 and spd >= 420:
+    融合特征：
+      1) 击球点高度 lift       — 杀球/高远/头顶最高，吊球中等，搓球网前低位
+      2) 挥拍角速度 spd        — 杀球极快，高远/头顶中等，搓球/放网极慢
+      3) 动作时长 win_frames    — 搓球片段最短，挑球较长，头顶球偏长
+      4) 击球后腕部走向 post    — 挑球继续上升，杀球快速回落，搓球接近水平
+
+    force: "clear"/"drop"/"smash"/"lift"/"net"/"around_head"/None（None 表示自动分类）
+    """
+    # 用户指定 → 直接采纳，不走决策树（保研演示时避免被分类错误打断节奏）
+    if force in ("clear", "drop", "smash", "lift", "net", "around_head"):
+        return force
+
+    lift = float(a.get("impact_lift", 0.0))
+    spd = float(a.get("swing_speed", 0.0))
+    post = float(a.get("post_move", 0.0))
+    n_frames = int(a.get("win_frames", 30))
+    brake = a.get("wrist_brake", [])
+
+    scores = {"smash": 0.0, "lift": 0.0, "drop": 0.0, "clear": 0.0,
+              "net": 0.0, "around_head": 0.0}
+
+    # —— 击球点高度（y 差，越大越高）——
+    # 杀球 ≥ 0.10；  高远 ≥ 0.04；  吊球 0.0–0.06；  挑球 ≤ 0.0（下手位）
+    if lift >= 0.10:
+        scores["smash"] += 1.0
+        scores["clear"] += 0.4
+    elif lift >= 0.04:
+        scores["clear"] += 0.7
+        scores["drop"] += 0.3
+    elif lift >= 0.0:
+        scores["drop"] += 0.7
+        scores["clear"] += 0.2
+    else:
+        scores["lift"] += 1.0  # 击球点低于肩 → 挑球
+        scores["net"] += 0.4   # 网前低位也可能是搓球/放网
+
+    # —— 挥拍角速度 ——
+    # 杀球 ≥ 420；  高远/头顶 300–420；  吊球 200–300；  搓球/放网 < 200（轻技术）
+    if spd >= 420:
+        scores["smash"] += 1.0
+        scores["clear"] += 0.3
+    elif spd >= 300:
+        scores["clear"] += 1.0
+        scores["around_head"] += 0.6
+        scores["drop"] += 0.2
+    elif spd >= 200:
+        scores["drop"] += 1.0
+        scores["lift"] += 0.3
+    elif spd >= 120:
+        scores["drop"] += 0.6
+        scores["net"] += 0.8
+    else:
+        scores["net"] += 1.2  # 极慢挥速 → 网前轻技术特征
+        scores["lift"] += 0.4
+
+    # —— 动作时长（30FPS 下片段帧数）——
+    # 搓球/放网片段极短（≤14 帧），吊球短，挑球较长（≥30 帧），高远/头顶居中偏长
+    if n_frames <= 14:
+        scores["net"] += 1.0
+        scores["drop"] += 0.3
+    elif n_frames <= 18:
+        scores["drop"] += 0.8
+    elif n_frames <= 26:
+        scores["clear"] += 0.4
+        scores["smash"] += 0.2
+    else:
+        scores["lift"] += 0.4
+        scores["clear"] += 0.3
+        scores["around_head"] += 0.4  # 头顶球片段偏长（绕头动作幅度大）
+
+    # —— 击球后手腕走向 ——
+    # 挑球 post < -0.03（继续上升）；  杀球 post > 0（快速回落）；  搓球接近水平
+    if post < -0.03:
+        scores["lift"] += 1.2
+    elif post > 0.02:
+        scores["smash"] += 0.6
+        scores["clear"] += 0.3
+    elif abs(post) < 0.015:  # 水平推送 → 网前轻技术特征
+        scores["net"] += 0.8
+    else:
+        scores["drop"] += 0.4
+
+    # —— 腕部制动：击球后第一帧的 y 变化 ——
+    # 杀球制动手腕会快速下压（正）；  吊球制动手腕较柔和；  搓球几乎无垂直位移
+    if brake:
+        first = brake[0]
+        if first > 0.01:  # 立即下压
+            scores["smash"] += 0.4
+        elif first < -0.005:  # 继续上送
+            scores["lift"] += 0.3
+        elif abs(first) < 0.004:  # 水平静止 → 搓球切削
+            scores["net"] += 0.5
+
+    # 取最大得分；若过于接近则用兜底
+    best = max(scores.items(), key=lambda x: x[1])
+    # —— 硬规则兜底（优先级从高到低）——
+    # 1) 高 lift + 高 spd 一定是杀球
+    if lift >= 0.12 and spd >= 420:
         return "smash"
-    if post < -0.03:  # 击球后手腕继续上升 → 下手位向上发力
-        return "lift"
-    if spd < 260:
-        return "drop"
-    return "clear"
+    # 2) 极慢挥速 + 低位击球 → 搓球/放网（轻技术特征最不易混淆）
+    if spd < 160 and lift < 0.03:
+        return "net"
+    # 3) 高位击球 + 中等挥速 + 长片段 → 头顶球（被动过渡）
+    if lift >= 0.05 and 280 <= spd < 420 and n_frames >= 24:
+        return "around_head"
+    return best[0]
 
 
 def score_and_feedback(a, action="clear"):
@@ -586,6 +702,17 @@ def score_and_feedback(a, action="clear"):
             fb.append(("tip", "练习：多球训练低手位挑球，强调「拍面朝上、小臂带腕上送」。"))
         else:
             fb.append(("ok", "击球后球拍随挥上送充分（%.0f%%），挑球弧线饱满。" % (-a["post_move"] * 100)))
+    elif action == "net":
+        # 网前轻技术：击球点低于肩是正常的，改为评价「出手稳定性」
+        if abs(a["post_move"]) > 0.04:
+            score -= 14
+            fb.append(("err", "击球后手腕晃动过大（净变化 %.0f%%）：搓球/放网讲究贴拍轻送，动作过大球易出界或下网。" % (a["post_move"] * 100)))
+            fb.append(("tip", "练习：网前原地搓球 30 次/组，体会「手指捻动、拍面托送」的柔和手感。"))
+        else:
+            fb.append(("ok", "出手柔和稳定（腕部净变化 %.0f%%），符合网前轻技术控制要求。" % (a["post_move"] * 100)))
+        if a["peak_elbow"] > 165:
+            score -= 8
+            fb.append(("warn", "肘部伸展 %.0f°偏大：网前动作讲究小臂带动手腕，大幅挥臂反而失去控制。" % a["peak_elbow"]))
     else:
         if a["impact_lift"] <= lift_min + (0.02 if action == "drop" else 0.0):
             score -= 18
@@ -732,7 +859,7 @@ st.markdown(
     """
     <div class="big-title">
       <h1>🏸 羽毛球动作智能化教学辅助系统</h1>
-      <p>基于 MediaPipe 六关节动力链分析与 DTW 模板匹配诊断 · v4.0 · 大学生创新创业训练项目</p>
+      <p>基于 MediaPipe 六关节动力链分析与 DTW 模板匹配诊断 · v4.2 · 大学生创新创业训练项目</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -743,10 +870,23 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 单人动作分析", "⚖️ 标准动�
 # ============ Tab1：单人分析 ============
 with tab1:
     st.markdown("上传一段羽毛球击球视频（单一动作或连续多个动作均可），系统自动切分每一次击球、识别动作类型，逐段给出关节角度与专项评分。")
+
+    # —— v4.1 新增：动作类型指定（v4.2 扩展至 6 类动作）——
+    # "🤖 自动分类" → 走决策树多特征融合；其他 → 直接套用对应规则
+    force_choice = st.selectbox(
+        "🎬 这段视频的动作类型（可手动指定以提升识别准确率）",
+        ["🤖 自动分类", "🏸 高远球", "💥 杀球", "🎯 吊球", "⤴️ 挑球", "🎾 搓球/放网", "🌀 头顶球"],
+        key="force_action_choice",
+        help="勾选自动分类让系统智能识别；若识别有误，可手动指定动作类型（推荐演示时使用）",
+    )
+    force_map = {"🏸 高远球": "clear", "💥 杀球": "smash", "🎯 吊球": "drop", "⤴️ 挑球": "lift",
+                 "🎾 搓球/放网": "net", "🌀 头顶球": "around_head"}
+    force_action = force_map.get(force_choice, None)
+
     data = load_video_bytes("solo", "上传学员视频")
     if data and st.button("🚀 开始分析", key="btn_solo"):
         with st.spinner("正在逐帧姿态估计与动作分割……"):
-            a = analyze_video(data, label="solo")
+            a = analyze_video(data, label="solo", force_action=force_action)
         if a is None:
             st.error("未能检测到人体关键点，请确认视频中人物全身清晰、光线充足。")
         else:
@@ -1018,7 +1158,7 @@ with tab4:
 - **姿态估计**：MediaPipe Pose（33 个身体关键点，含置信度滤波与平滑）
 - **六关节动力链**：肘、肩、腕、髋、膝、踝——覆盖「踝蹬转 → 膝蹬伸 → 髋转体 → 肩挥臂 → 肘鞭打 → 腕控拍」完整发力链
 - **动作分割**：基于手腕垂直速度多峰检测，自动切分视频中的每一次击球（最多 6 拍）
-- **动作识别**：基于运动学特征（击球点高度、挥拍角速度、击球前后手腕轨迹）的决策树分类，支持高远球/杀球/吊球/挑球四类
+- **动作识别**：基于运动学特征（击球点高度、挥拍角速度、动作时长、击球前后手腕轨迹）的多特征加权投票分类，支持高远球/杀球/吊球/挑球/搓球放网/头顶球六类；另提供手动指定动作类型（v4.2），识别不确定时用户可强制指定
 - **评分引擎（双基准）**：
   - 有标准模板 → **六关节加权 DTW 模板匹配**（z-score 归一化后比曲线形状，按动力链环节逐段诊断）
   - 无标准模板 → 运动生物力学**常模规则库**（肘部伸展、转体幅度、挥速、击球点高度、随挥轨迹）
@@ -1047,13 +1187,15 @@ with tab4:
 这样设计的理由：动作节奏因人而异可以宽容，但关节角度脱离标准（如膝角差 45°）就是实打实的
 技术问题——两者必须分开评价，诊断建议也会区分"时序问题"和"幅度问题"。
 
-#### 四种动作的识别逻辑
+#### 六种动作的识别逻辑
 | 动作 | 关键特征 |
 |---|---|
 | 杀球 | 击球点远高于肩 + 挥拍角速度极快（≥420°/s）|
 | 挑球 | 击球后手腕持续上升（下手位向上发力）|
 | 吊球 | 挥拍角速度慢（<260°/s，减力切削）|
 | 高远球 | 完整鞭打动作：挥速快 + 击球后随挥下落 |
+| 搓球/放网 | 挥速极慢（<160°/s）+ 击球点低位（网前轻技术，出手近水平）|
+| 头顶球 | 高位击球 + 中等挥速（280–420°/s）+ 片段偏长（绕头顶被动过渡）|
 
 #### 使用建议
 - 视频要求：侧面机位（持拍侧朝镜头）、全身入镜、光线充足
