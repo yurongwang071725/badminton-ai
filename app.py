@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-羽毛球高远球动作智能化教学辅助系统 v3.0
+羽毛球动作智能化教学辅助系统 v5.1
 =========================================
 功能：
   1. 单人动作分析：多拍切分 + 逐拍动作识别 + 骨骼标注 + 角度曲线 + 评分 + 文字诊断建议
   2. 标准动作对比：上传标准视频与学员视频，击球时刻自动对齐，曲线叠加对比
-  3. 动作标准库（v3 新增）：分析标准视频一键保存为"动作模板"；
+  3. 动作标准库：分析标准视频一键保存为"动作模板"；
      学员视频与模板做 DTW（动态时间规整）匹配，给出相似度分数与逐阶段偏差诊断
-依赖：streamlit==1.31.0 / mediapipe==0.10.9 / opencv-python==4.9.0.80 / numpy==1.26.4 / pandas==2.2.0
+  4. 球轨迹分析（v5 新增，v5.1 双引擎）：YOLOv8 / TrackNetV2 双引擎逐帧定位羽毛球，
+     绘制飞行轨迹、估算画面球速、标记高速击球时刻；支持侧面 / 正后方双机位模式
+依赖：streamlit==1.31.0 / mediapipe==0.10.18 / opencv-python-headless==4.10.0.84
+      numpy==1.26.4 / pandas==2.2.0 / ultralytics==8.3.39
 """
 
 import json
@@ -21,7 +24,7 @@ import streamlit as st
 import mediapipe as mp
 
 # ============ 页面配置 ============
-st.set_page_config(page_title="羽毛球高远球智能教学系统", page_icon="羽毛球", layout="wide")
+st.set_page_config(page_title="羽毛球高远球智能教学系统", page_icon="🏸", layout="wide")
 
 # ============ 界面美化 CSS ============
 st.markdown(
@@ -74,21 +77,6 @@ ACTION_PROFILES = {
         "ideal": {
             "elbow_peak": (120, 160), "swing_speed": 200,
             "post_rise": 0.04,
-        },
-    },
-    "net": {     # 搓球/放网（网前轻技术，合并为一类评价）
-        "name": "搓球/放网", "emoji": "🎾",
-        "ideal": {
-            "elbow_peak": (110, 160), "shoulder_peak": (80, 130),
-            "swing_speed": 120, "swing_speed_max": 280,
-            # 网前技术击球点天然低于肩：不设 impact_lift 下限，见 score_and_feedback 特殊分支
-        },
-    },
-    "around_head": {  # 头顶球（头顶区被动过渡）
-        "name": "头顶球", "emoji": "🌀",
-        "ideal": {
-            "elbow_peak": (150, 175), "shoulder_peak": (140, 175),
-            "swing_speed": 320, "impact_lift": 0.03,
         },
     },
 }
@@ -360,6 +348,7 @@ LBL_COLOR = {"elbow": (0, 0, 255), "shoulder": (255, 0, 0), "wrist": (0, 160, 25
 
 
 def draw_annotated(frame_bgr, landmarks, angles, side="right"):
+
     """画骨骼 + 多关节角度数字（角度：{关节key: 度数}）"""
     mp_drawing.draw_landmarks(
         frame_bgr, landmarks, mp_pose.POSE_CONNECTIONS,
@@ -383,10 +372,9 @@ def draw_annotated(frame_bgr, landmarks, angles, side="right"):
 
 
 # ============ 核心分析 ============
-def analyze_video(video_bytes, label="", force_action=None):
+def analyze_video(video_bytes, label=""):
     """逐帧姿态估计。返回 dict：
-    jpgs(标注帧) elbow/shoulder(角度序列) impact(击球帧索引) fps 及派生指标
-    force_action: "clear"/"drop"/"smash"/"lift"/None（None 表示自动分类）"""
+    jpgs(标注帧) elbow/shoulder(角度序列) impact(击球帧索引) fps 及派生指标"""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
         tmp = f.name
@@ -452,7 +440,7 @@ def analyze_video(video_bytes, label="", force_action=None):
         m = segment_metrics(series, wy, sh, imp, dt)
         if m is None:
             continue
-        m["action"] = classify_action(m, force=force_action)
+        m["action"] = classify_action(m)
         segments.append(m)
 
     if not segments:
@@ -521,7 +509,6 @@ def segment_metrics(series, wy, sh, impact, dt):
 
     m = {
         "impact": impact, "win_lo": lo, "win_hi": hi,
-        "win_frames": len(elbow_win),  # 动作片段帧数（时长代理）
         "swing_speed": (max(diffs) / dt) if diffs else 0.0,
         "impact_lift": float(sh.iloc[impact] - wy.iloc[impact]),
         "post_move": float(wy.iloc[p_hi] - wy.iloc[p_lo]) if p_hi > p_lo else 0.0,
@@ -533,124 +520,25 @@ def segment_metrics(series, wy, sh, impact, dt):
         m[k] = win
         m["peak_" + k] = float(max(win))
         m["min_" + k] = float(min(win))
-    # 腕部制动时刻：击球后手腕最早就停止上升的偏移量
-    wrist_eff = []
-    for k in range(p_lo, p_hi):
-        if pd.notna(wy.iloc[k]) and pd.notna(wy.iloc[k + 1]):
-            wrist_eff.append(float(wy.iloc[k + 1] - wy.iloc[k]))  # 负=继续上升
-    m["wrist_brake"] = wrist_eff
     return m
 
 
-def classify_action(a, force=None):
-    """动作分类 — 多特征加权投票（v4.2，支持 6 类动作）
+def classify_action(a):
+    """动作分类决策树（基于运动学特征，MediaPipe y 轴向下为正）：
+    1) 击球点远高于肩 + 挥速极快 → 杀球
+    2) 击球后手腕仍持续上升（y 减小，post_move<0）→ 挑球（下手位向上发力）
+    3) 挥速慢 → 吊球（减力切削）
+    4) 其余 → 高远球兜底（本项目主动作）"""
+    lift, spd = a["impact_lift"], a["swing_speed"]
+    post = a["post_move"]
 
-    融合特征：
-      1) 击球点高度 lift       — 杀球/高远/头顶最高，吊球中等，搓球网前低位
-      2) 挥拍角速度 spd        — 杀球极快，高远/头顶中等，搓球/放网极慢
-      3) 动作时长 win_frames    — 搓球片段最短，挑球较长，头顶球偏长
-      4) 击球后腕部走向 post    — 挑球继续上升，杀球快速回落，搓球接近水平
-
-    force: "clear"/"drop"/"smash"/"lift"/"net"/"around_head"/None（None 表示自动分类）
-    """
-    # 用户指定 → 直接采纳，不走决策树（保研演示时避免被分类错误打断节奏）
-    if force in ("clear", "drop", "smash", "lift", "net", "around_head"):
-        return force
-
-    lift = float(a.get("impact_lift", 0.0))
-    spd = float(a.get("swing_speed", 0.0))
-    post = float(a.get("post_move", 0.0))
-    n_frames = int(a.get("win_frames", 30))
-    brake = a.get("wrist_brake", [])
-
-    scores = {"smash": 0.0, "lift": 0.0, "drop": 0.0, "clear": 0.0,
-              "net": 0.0, "around_head": 0.0}
-
-    # —— 击球点高度（y 差，越大越高）——
-    # 杀球 ≥ 0.10；  高远 ≥ 0.04；  吊球 0.0–0.06；  挑球 ≤ 0.0（下手位）
-    if lift >= 0.10:
-        scores["smash"] += 1.0
-        scores["clear"] += 0.4
-    elif lift >= 0.04:
-        scores["clear"] += 0.7
-        scores["drop"] += 0.3
-    elif lift >= 0.0:
-        scores["drop"] += 0.7
-        scores["clear"] += 0.2
-    else:
-        scores["lift"] += 1.0  # 击球点低于肩 → 挑球
-        scores["net"] += 0.4   # 网前低位也可能是搓球/放网
-
-    # —— 挥拍角速度 ——
-    # 杀球 ≥ 420；  高远/头顶 300–420；  吊球 200–300；  搓球/放网 < 200（轻技术）
-    if spd >= 420:
-        scores["smash"] += 1.0
-        scores["clear"] += 0.3
-    elif spd >= 300:
-        scores["clear"] += 1.0
-        scores["around_head"] += 0.6
-        scores["drop"] += 0.2
-    elif spd >= 200:
-        scores["drop"] += 1.0
-        scores["lift"] += 0.3
-    elif spd >= 120:
-        scores["drop"] += 0.6
-        scores["net"] += 0.8
-    else:
-        scores["net"] += 1.2  # 极慢挥速 → 网前轻技术特征
-        scores["lift"] += 0.4
-
-    # —— 动作时长（30FPS 下片段帧数）——
-    # 搓球/放网片段极短（≤14 帧），吊球短，挑球较长（≥30 帧），高远/头顶居中偏长
-    if n_frames <= 14:
-        scores["net"] += 1.0
-        scores["drop"] += 0.3
-    elif n_frames <= 18:
-        scores["drop"] += 0.8
-    elif n_frames <= 26:
-        scores["clear"] += 0.4
-        scores["smash"] += 0.2
-    else:
-        scores["lift"] += 0.4
-        scores["clear"] += 0.3
-        scores["around_head"] += 0.4  # 头顶球片段偏长（绕头动作幅度大）
-
-    # —— 击球后手腕走向 ——
-    # 挑球 post < -0.03（继续上升）；  杀球 post > 0（快速回落）；  搓球接近水平
-    if post < -0.03:
-        scores["lift"] += 1.2
-    elif post > 0.02:
-        scores["smash"] += 0.6
-        scores["clear"] += 0.3
-    elif abs(post) < 0.015:  # 水平推送 → 网前轻技术特征
-        scores["net"] += 0.8
-    else:
-        scores["drop"] += 0.4
-
-    # —— 腕部制动：击球后第一帧的 y 变化 ——
-    # 杀球制动手腕会快速下压（正）；  吊球制动手腕较柔和；  搓球几乎无垂直位移
-    if brake:
-        first = brake[0]
-        if first > 0.01:  # 立即下压
-            scores["smash"] += 0.4
-        elif first < -0.005:  # 继续上送
-            scores["lift"] += 0.3
-        elif abs(first) < 0.004:  # 水平静止 → 搓球切削
-            scores["net"] += 0.5
-
-    # 取最大得分；若过于接近则用兜底
-    best = max(scores.items(), key=lambda x: x[1])
-    # —— 硬规则兜底（优先级从高到低）——
-    # 1) 高 lift + 高 spd 一定是杀球
-    if lift >= 0.12 and spd >= 420:
+    if lift > 0.12 and spd >= 420:
         return "smash"
-    # 2) 极慢挥速 + 低位击球 → 搓球/放网（轻技术特征最不易混淆）
-    if spd < 160 and lift < 0.03:
-        return "net"
-    # 3) 高位击球 + 中等挥速 + 长片段 → 头顶球（被动过渡）
-    if lift >= 0.05 and 280 <= spd < 420 and n_frames >= 24:
-        return "around_head"
-    return best[0]
+    if post < -0.03:  # 击球后手腕继续上升 → 下手位向上发力
+        return "lift"
+    if spd < 260:
+        return "drop"
+    return "clear"
 
 
 def score_and_feedback(a, action="clear"):
@@ -702,17 +590,6 @@ def score_and_feedback(a, action="clear"):
             fb.append(("tip", "练习：多球训练低手位挑球，强调「拍面朝上、小臂带腕上送」。"))
         else:
             fb.append(("ok", "击球后球拍随挥上送充分（%.0f%%），挑球弧线饱满。" % (-a["post_move"] * 100)))
-    elif action == "net":
-        # 网前轻技术：击球点低于肩是正常的，改为评价「出手稳定性」
-        if abs(a["post_move"]) > 0.04:
-            score -= 14
-            fb.append(("err", "击球后手腕晃动过大（净变化 %.0f%%）：搓球/放网讲究贴拍轻送，动作过大球易出界或下网。" % (a["post_move"] * 100)))
-            fb.append(("tip", "练习：网前原地搓球 30 次/组，体会「手指捻动、拍面托送」的柔和手感。"))
-        else:
-            fb.append(("ok", "出手柔和稳定（腕部净变化 %.0f%%），符合网前轻技术控制要求。" % (a["post_move"] * 100)))
-        if a["peak_elbow"] > 165:
-            score -= 8
-            fb.append(("warn", "肘部伸展 %.0f°偏大：网前动作讲究小臂带动手腕，大幅挥臂反而失去控制。" % a["peak_elbow"]))
     else:
         if a["impact_lift"] <= lift_min + (0.02 if action == "drop" else 0.0):
             score -= 18
@@ -822,6 +699,7 @@ def show_metrics(a, score=None):
 
 def eval_segment(seg, action):
     """统一评分入口：有该动作的标准模板 → DTW 模板匹配；无 → 常模规则。
+
     返回 (总分, 反馈列表, 评价模式, 模板名, 各关节相似度)"""
     tpl_map = load_templates()
     tpl = tpl_map.get(action)
@@ -854,39 +732,450 @@ def show_chain_sims(sims):
     st.caption("动力链顺序：踝（蹬转）→ 膝（蹬伸）→ 髋（转体）→ 肩（挥臂）→ 肘（鞭打）→ 腕（控拍）")
 
 
+# ============ 球轨迹分析（YOLO 目标检测，v5 新增） ============
+SHUTTLE_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shuttle_best.pt")
+SHUTTLE_FRAME_W = 640   # 分析统一缩放到的画面宽度（像素）
+TRAIL_LEN = 22          # 轨迹拖尾长度（采样帧数）
+SHUTTLE_MAX_JPGS = 220  # 最多缓存的轨迹标注帧（控制内存）
+
+
+@st.cache_resource(show_spinner="正在加载羽毛球检测模型……")
+def load_shuttle_model():
+    """懒加载 YOLOv8n 羽毛球检测权重（ultralytics/torch 也在此懒导入，
+    保证权重缺失或依赖异常时前四个标签页不受影响）。权重缺失返回 None。"""
+    if not os.path.exists(SHUTTLE_WEIGHTS):
+        return None
+    from ultralytics import YOLO
+    import torch
+    try:
+        torch.set_num_threads(max(1, (os.cpu_count() or 2)))
+    except Exception:
+        pass
+    return YOLO(SHUTTLE_WEIGHTS)
+
+
+def _draw_trail(vis, pts, tail=TRAIL_LEN):
+    """在帧上画轨迹拖尾：旧点黄绿 → 新点红，末点画实心圆。坐标为缩放后像素。
+    相邻点位移超过画面宽 40% 视为误检跳变，不连线。"""
+    seg = pts[-tail:]
+    n = len(seg)
+    max_jump = SHUTTLE_FRAME_W * 0.4
+    for j in range(1, n):
+        dx = seg[j][0] - seg[j - 1][0]
+        dy = seg[j][1] - seg[j - 1][1]
+        if dx * dx + dy * dy > max_jump * max_jump:
+            continue  # 跳变段不画线
+        t = (j + 1) / n  # 0→1 越来越新
+        color = (0, int(220 - 200 * t), int(40 + 215 * t))  # BGR 绿→黄→红
+        cv2.line(vis, (int(seg[j - 1][0]), int(seg[j - 1][1])),
+                 (int(seg[j][0]), int(seg[j][1])), color, 2, cv2.LINE_AA)
+    if n:
+        cv2.circle(vis, (int(seg[-1][0]), int(seg[-1][1])), 5, (0, 0, 255), -1, cv2.LINE_AA)
+
+
+def analyze_shuttle_video(video_bytes, camera="side", conf=0.20, step=2, max_seconds=12):
+    """YOLO 逐帧检测羽毛球 → 轨迹 → 球速。camera: "side"（侧面）| "back"（正后方）。
+    返回 dict：jpgs(轨迹标注帧) pts(轨迹点) speeds(球速序列) hits(高速击球时刻) 等；
+    球检出过少时返回 None。"""
+    model = load_shuttle_model()
+    if model is None:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(video_bytes)
+        tmp = f.name
+    cap = cv2.VideoCapture(tmp)
+    if not cap.isOpened():
+        os.unlink(tmp)
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    max_raw = int(max_seconds * fps)
+    dt = step / fps  # 相邻采样帧的时间间隔（秒）
+
+    raw_pts = []   # (采样帧号, x_norm, y_norm, conf)
+    jpgs = []      # 带轨迹叠加的标注帧（与采样帧号一一对应）
+    trail = []     # 拖尾点（缩放后像素坐标，未检出为 None）
+    si, idx = 0, 0
+    while True:
+        ok, frame = cap.read()
+        if not ok or idx >= max_raw:
+            break
+        if idx % step == 0:
+            frame = cv2.resize(frame, (SHUTTLE_FRAME_W,
+                                       int(frame.shape[0] * SHUTTLE_FRAME_W / frame.shape[1])))
+            res = model.predict(frame, imgsz=640, conf=conf, verbose=False)[0]
+            if len(res.boxes):
+                b = max(res.boxes, key=lambda bb: float(bb.conf))
+                x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                c = float(b.conf)
+                raw_pts.append((si, cx / SHUTTLE_FRAME_W, cy / SHUTTLE_FRAME_W, c))
+                trail.append((cx, cy))
+            else:
+                trail.append(None)
+            vis = frame.copy()
+            valid = [p for p in trail if p]
+            _draw_trail(vis, valid)
+            if len(res.boxes):
+                cv2.circle(vis, (int(trail[-1][0]), int(trail[-1][1])), 12, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(vis, "shuttle %.2f" % c, (int(trail[-1][0]) + 14, int(trail[-1][1]) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            if len(jpgs) < SHUTTLE_MAX_JPGS:
+                ok2, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 82])
+                if ok2:
+                    jpgs.append(buf.tobytes())
+            si += 1
+        idx += 1
+    cap.release()
+    os.unlink(tmp)
+    return _shuttle_postprocess(raw_pts, jpgs, fps, dt, step, si, idx, camera, max_raw)
+
+
+def _shuttle_postprocess(raw_pts, jpgs, fps, dt, step, si, idx, camera, max_raw):
+    """球轨迹公共后处理（YOLO / TrackNet 双引擎共用）：
+    短缺口插值 → 球速估算 → 高速击球时刻检测。检出过少返回 None。"""
+    if len(raw_pts) < 5 or si < 6:
+        return None
+
+    # —— 轨迹后处理：短缺口（≤3 个采样帧）线性插值，长缺口断开 ——
+    pts = sorted(raw_pts, key=lambda p: p[0])
+    interp = []
+    for k, p in enumerate(pts):
+        interp.append(p)
+        if k + 1 < len(pts) and 1 < pts[k + 1][0] - p[0] <= 3:
+            p2 = pts[k + 1]
+            g = p2[0] - p[0]
+            for j in range(1, g):
+                t = j / g
+                interp.append((p[0] + j, p[1] + (p2[1] - p[1]) * t,
+                               p[2] + (p2[2] - p[2]) * t, 0.0))
+
+    # —— 球速：相邻采样帧位移 / 时间（画面像素/秒），滑窗中值去噪 ——
+    # 单步位移超过画面宽 40% 视为误检跳变，不计入速度
+    max_jump = SHUTTLE_FRAME_W * 0.4
+    speeds = []
+    for k in range(1, len(interp)):
+        s0, s1 = interp[k - 1], interp[k]
+        if s1[0] - s0[0] == 1:
+            dx = (s1[1] - s0[1]) * SHUTTLE_FRAME_W
+            dy = (s1[2] - s0[2]) * SHUTTLE_FRAME_W
+            if dx * dx + dy * dy > max_jump * max_jump:
+                continue
+            speeds.append((s1[0], (dx * dx + dy * dy) ** 0.5 / dt))
+    sv = np.array([v for _, v in speeds]) if speeds else np.array([])
+    sv_s = pd.Series(sv).rolling(3, center=True, min_periods=1).median().values if len(sv) >= 3 else sv
+
+    # —— 高速击球时刻：球速局部峰值（超过 P90×1.3），最小间隔 0.4s ——
+    hits = []
+    speed_thr = float(np.percentile(sv_s, 90) * 1.3) if len(sv_s) else 0.0
+    min_gap = max(1, int(0.4 / dt))
+    cands = [(speeds[i][0], float(sv_s[i])) for i in range(1, len(sv_s) - 1)
+             if sv_s[i] > speed_thr and sv_s[i] >= sv_s[i - 1] and sv_s[i] >= sv_s[i + 1]]
+    cands.sort(key=lambda x: -x[1])
+    for f_i, v in cands:
+        if all(abs(f_i - j) >= min_gap for j, _ in hits):
+            hits.append((f_i, v))
+        if len(hits) >= MAX_ACTIONS:
+            break
+    if not hits and len(sv_s):  # 兜底：无明显峰值时取全局最快处（如飞行段过短）
+        best_i = int(np.argmax(sv_s))
+        hits = [(speeds[best_i][0], float(sv_s[best_i]))]
+    hits.sort()
+
+    return {
+        "camera": camera, "jpgs": jpgs, "fps": fps, "dt": dt, "step": step,
+        "pts": interp, "speeds": [(s, float(v)) for (s, _), v in zip(speeds, sv_s)],
+        "hits": hits, "n_sampled": si, "n_detected": len(raw_pts),
+        "detect_rate": len(raw_pts) / max(1, si),
+        "max_speed": float(np.max(sv_s)) if len(sv_s) else 0.0,
+        "n_frames": min(max_raw, idx),
+    }
+
+
+# ---- TrackNetV2 第二检测引擎（借鉴 ChgygLin/TrackNetV2-pytorch 开源复现；
+#      原论文：TrackNetV2: Efficient Shuttlecock Tracking Network, NTHU） ----
+TRACKNET_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracknet_weights.pt")
+TRACKNET_URL = "https://raw.githubusercontent.com/ChgygLin/TrackNetV2-pytorch/main/tf2torch/track.pt"
+TRACKNET_SIZE = 45398809  # 权重字节数（完整性校验）
+
+
+def ensure_tracknet_weights():
+    """确保 TrackNetV2 权重存在；缺失则从原仓库自动下载（仅首次，43MB）。"""
+    if os.path.exists(TRACKNET_WEIGHTS) and os.path.getsize(TRACKNET_WEIGHTS) >= TRACKNET_SIZE:
+        return True
+    try:
+        import requests
+        progress = st.progress(0, text="正在下载 TrackNetV2 权重（43MB，仅首次运行需要）……")
+        got = 0
+        tmp = TRACKNET_WEIGHTS + ".part"
+        with requests.get(TRACKNET_URL, stream=True, timeout=(10, 60)) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 512):
+                    if chunk:
+                        f.write(chunk)
+                        got += len(chunk)
+                        progress.progress(min(0.99, got / TRACKNET_SIZE),
+                                          text="正在下载 TrackNetV2 权重 %.1f/%.1f MB……"
+                                               % (got / 1048576, TRACKNET_SIZE / 1048576))
+        if os.path.getsize(tmp) < TRACKNET_SIZE:
+            raise IOError("下载不完整（%d/%d 字节），稍后重试即可" % (os.path.getsize(tmp), TRACKNET_SIZE))
+        os.replace(tmp, TRACKNET_WEIGHTS)
+        progress.progress(1.0, text="权重下载完成 ✅")
+        return True
+    except Exception as e:
+        st.error("TrackNetV2 权重下载失败：%s。可手动下载 %s 并上传到仓库根目录（改名 tracknet_weights.pt）。" % (e, TRACKNET_URL))
+        return False
+
+
+@st.cache_resource(show_spinner="正在加载 TrackNetV2 模型……")
+def load_tracknet_model():
+    """构建并加载 TrackNetV2（pytorch 权重，来自官方 TF 权重转换）。"""
+    import torch
+    from torch import nn
+
+    class TNConv(nn.Module):
+        """官方 TF 权重的 BN 建立在宽度维上（非通道维，TF channels_last 习惯），
+        故 BN 通道数 bc 独立于 conv 输出通道 oc；forward 中先转 NHWC 再归一化。
+        因此输入图宽必须为 512（bc 序列 512/256/128/64 与宽度下采样对应）。"""
+
+        def __init__(self, ic, oc, bc):
+            super().__init__()
+            self.conv = nn.Conv2d(ic, oc, kernel_size=3, padding=1)
+            self.bn = nn.BatchNorm2d(bc)
+            self.act = nn.ReLU()
+
+        def forward(self, x):
+            x = self.act(self.conv(x))
+            x = x.transpose(1, 3)   # NCHW -> NHWC
+            x = self.bn(x)
+            x = x.transpose(1, 3)   # NHWC -> NCHW
+            return x
+
+    class TrackNetV2(nn.Module):
+        """结构同官方 TF 权重（经 ChgygLin/TrackNetV2-pytorch 转换）：
+        3 帧 RGB（9 通道）输入 → VGG16 编码 + UNet 解码 → 3 张热图。
+        属性名与权重 state_dict 一致，可直接 load_state_dict。"""
+
+        def __init__(self):
+            super().__init__()
+            self.conv2d_1 = TNConv(9, 64, 512)
+            self.conv2d_2 = TNConv(64, 64, 512)
+            self.max_pooling_1 = nn.MaxPool2d((2, 2), stride=(2, 2))
+            self.conv2d_3 = TNConv(64, 128, 256)
+            self.conv2d_4 = TNConv(128, 128, 256)
+            self.max_pooling_2 = nn.MaxPool2d((2, 2), stride=(2, 2))
+            self.conv2d_5 = TNConv(128, 256, 128)
+            self.conv2d_6 = TNConv(256, 256, 128)
+            self.conv2d_7 = TNConv(256, 256, 128)
+            self.max_pooling_3 = nn.MaxPool2d((2, 2), stride=(2, 2))
+            self.conv2d_8 = TNConv(256, 512, 64)
+            self.conv2d_9 = TNConv(512, 512, 64)
+            self.conv2d_10 = TNConv(512, 512, 64)
+            self.up_sampling_1 = nn.UpsamplingNearest2d(scale_factor=2)
+            self.conv2d_11 = TNConv(768, 256, 128)
+            self.conv2d_12 = TNConv(256, 256, 128)
+            self.conv2d_13 = TNConv(256, 256, 128)
+            self.up_sampling_2 = nn.UpsamplingNearest2d(scale_factor=2)
+            self.conv2d_14 = TNConv(384, 128, 256)
+            self.conv2d_15 = TNConv(128, 128, 256)
+            self.up_sampling_3 = nn.UpsamplingNearest2d(scale_factor=2)
+            self.conv2d_16 = TNConv(192, 64, 512)
+            self.conv2d_17 = TNConv(64, 64, 512)
+            self.conv2d_18 = nn.Conv2d(64, 3, kernel_size=1, padding=0)
+
+        def forward(self, x):
+            x = self.conv2d_1(x)
+            x1 = self.conv2d_2(x)
+            x = self.max_pooling_1(x1)
+            x = self.conv2d_3(x)
+            x2 = self.conv2d_4(x)
+            x = self.max_pooling_2(x2)
+            x = self.conv2d_5(x)
+            x = self.conv2d_6(x)
+            x3 = self.conv2d_7(x)
+            x = self.max_pooling_3(x3)
+            x = self.conv2d_8(x)
+            x = self.conv2d_9(x)
+            x = self.conv2d_10(x)
+            x = self.up_sampling_1(x)
+            x = torch.concat([x, x3], dim=1)
+            x = self.conv2d_11(x)
+            x = self.conv2d_12(x)
+            x = self.conv2d_13(x)
+            x = self.up_sampling_2(x)
+            x = torch.concat([x, x2], dim=1)
+            x = self.conv2d_14(x)
+            x = self.conv2d_15(x)
+            x = self.up_sampling_3(x)
+            x = torch.concat([x, x1], dim=1)
+            x = self.conv2d_16(x)
+            x = self.conv2d_17(x)
+            x = self.conv2d_18(x)
+            return torch.sigmoid(x)
+
+    import torch as _t
+    model = TrackNetV2()
+    model.load_state_dict(_t.load(TRACKNET_WEIGHTS, map_location="cpu"))
+    model.eval()
+    try:
+        _t.set_num_threads(max(1, os.cpu_count() or 2))
+    except Exception:
+        pass
+    return model
+
+
+def _shuttle_heatmap_center(heatmap, thresh):
+    """热图 → (visible, cx, cy)：取全局峰值点，峰值超过 thresh 视为检出，
+    并在峰值周围小窗口内做加权质心（亚像素）。
+    转换权重的热图响应较温和（峰值约 0.1~0.5）且峰锐利，
+    argmax 局部质心比「阈值化最大连通域」更稳（弱响应下大片背景易误选）。
+    坐标为热图 (H,W) = (288,512) 坐标系。"""
+    h, w = heatmap.shape[:2]
+    af = int(heatmap.argmax())
+    ax, ay = af % w, af // w
+    if heatmap[ay, ax] < thresh:
+        return False, 0.0, 0.0
+    win = 15
+    y0, y1 = max(0, ay - win // 2), min(h, ay + win // 2 + 1)
+    x0, x1 = max(0, ax - win // 2), min(w, ax + win // 2 + 1)
+    patch = heatmap[y0:y1, x0:x1]
+    total = float(patch.sum())
+    if total <= 0:
+        return True, float(ax), float(ay)
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    return True, float((patch * xs).sum() / total), float((patch * ys).sum() / total)
+
+
+def analyze_shuttle_video_tracknet(video_bytes, camera="side", thresh=0.5, max_seconds=8):
+    """TrackNetV2 引擎：连续 3 帧 RGB 堆叠推理（步长 3，不重叠），热图质心定位球。
+    输出结构与 YOLO 引擎一致，共用轨迹后处理。"""
+          return None
+    import torch
+    import torchvision
+    model = load_tracknet_model()
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(video_bytes)
+        tmp = f.name
+    cap = cv2.VideoCapture(tmp)
+    if not cap.isOpened():
+        os.unlink(tmp)
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    max_raw = int(max_seconds * fps)
+    # 高帧率视频（如手机 60fps）按约 20fps 采样，控制 CPU 推理耗时（组内 3 帧取自相邻采样帧）
+    step_orig = max(1, int(round(fps / 20.0)))
+    dt = step_orig / fps  # 相邻采样点间隔 step_orig 个原始帧
+
+    raw_pts, jpgs, trail = [], [], []
+    si, idx, raw_i = 0, 0, 0
+    IMG_H, IMG_W = 288, 512
+    while idx < max_raw:
+        group = []
+        while len(group) < 3:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if raw_i % step_orig == 0:
+                group.append(frame)
+            raw_i += 1
+        if len(group) < 3:
+            break
+        # 预处理：RGB、归一化、抗混叠缩放（必须 to_tensor 后用 torchvision resize：
+        # 1080p→288x512 缩小近 4 倍，无抗混叠的 cv2 线性采样会丢失 1~2px 的球信号）
+        tensors = []
+        for fr in group:
+            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            t = torchvision.transforms.functional.to_tensor(rgb)  # (3,H,W) [0,1]
+            t = torchvision.transforms.functional.resize(t, [IMG_H, IMG_W], antialias=True)
+            tensors.append(t)
+        x = torch.cat(tensors, dim=0).unsqueeze(0)
+        with torch.no_grad():
+            pred = model(x)[0].cpu().numpy()  # (3,288,512)
+        # 一组 3 帧分别取热图质心
+        for gi, fr in enumerate(group):
+            frame = cv2.resize(fr, (SHUTTLE_FRAME_W, int(fr.shape[0] * SHUTTLE_FRAME_W / fr.shape[1])))
+            vis, cx, cy = _shuttle_heatmap_center(pred[gi], thresh)
+            if vis:
+                nx, ny = cx / IMG_W, cy / IMG_H
+                raw_pts.append((si, nx, ny, 1.0))
+                trail.append((nx * SHUTTLE_FRAME_W, ny * SHUTTLE_FRAME_W))
+            else:
+                trail.append(None)
+            vis_img = frame.copy()
+            _draw_trail(vis_img, [p for p in trail if p])
+            if vis:
+                px, py = int(trail[-1][0]), int(trail[-1][1])
+                cv2.circle(vis_img, (px, py), 12, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(vis_img, "TrackNet", (px + 14, py - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            if len(jpgs) < SHUTTLE_MAX_JPGS:
+                ok2, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+                if ok2:
+                    jpgs.append(buf.tobytes())
+            si += 1
+        idx += 3 * step_orig
+    cap.release()
+    os.unlink(tmp)
+    return _shuttle_postprocess(raw_pts, jpgs, fps, dt, 1, si, idx, camera, max_raw)
+
+
+def shuttle_landing_zones(r):
+    """正后方机位：按高速击球时刻切分飞行段，每段末端视为落点，
+    按画面横向位置分为左半场 / 中路 / 右半场。返回 (落点列表[(si,x_norm)], 计数dict)。"""
+    xs = {p[0]: p[1] for p in r["pts"]}
+    bounds = [h[0] for h in r["hits"]] + [max(xs.keys()) + 1]
+    lo = 0
+    lands = []
+    for b in bounds:
+        seg_si = [s for s in xs if lo <= s < b]
+        if len(seg_si) >= 3:
+            tail = sorted(seg_si)[-2:]
+            lands.append((tail[-1], float(np.mean([xs[s] for s in tail]))))
+        lo = b
+    cnt = {"left": 0, "mid": 0, "right": 0}
+    for _, x in lands:
+        cnt["left" if x < 0.4 else ("right" if x > 0.6 else "mid")] += 1
+    return lands, cnt
+
+def shuttle_hit_heights(r):
+    """侧面机位：各高速击球时刻的击球点高度（y_norm，越小越高）与文字评价。"""
+    ys = {p[0]: p[2] for p in r["pts"]}
+    out = []
+    for si_, v in r["hits"]:
+        if si_ in ys:
+            y = ys[si_]
+            tag = "偏高（上方击球）" if y < 0.33 else ("居中" if y < 0.55 else "偏低（下手位）")
+            out.append((si_, y, v, tag))
+    return out
+
+
+def speed_chart_df(r):
+    """球速-时间曲线数据（横轴：视频时间秒）。"""
+    t0 = [(s * r["dt"], v) for s, v in r["speeds"]]
+    return pd.DataFrame(t0, columns=["时间 (s)", "球速 (画面px/s)"])
+
+
 # ============ 页头 ============
 st.markdown(
     """
     <div class="big-title">
       <h1>🏸 羽毛球动作智能化教学辅助系统</h1>
-      <p>基于 MediaPipe 六关节动力链分析与 DTW 模板匹配诊断 · v4.2 · 大学生创新创业训练项目</p>
+      <p>MediaPipe 六关节动力链分析 · DTW 模板匹配诊断 · 双引擎球轨迹检测 · v5.1 · 大学生创新创业训练项目</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 单人动作分析", "⚖️ 标准动作对比", "🎯 动作标准库", "ℹ️ 系统说明"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 单人动作分析", "⚖️ 标准动作对比", "🎯 动作标准库", "🏸 球轨迹分析", "ℹ️ 系统说明"])
 
 # ============ Tab1：单人分析 ============
 with tab1:
     st.markdown("上传一段羽毛球击球视频（单一动作或连续多个动作均可），系统自动切分每一次击球、识别动作类型，逐段给出关节角度与专项评分。")
-
-    # —— v4.1 新增：动作类型指定（v4.2 扩展至 6 类动作）——
-    # "🤖 自动分类" → 走决策树多特征融合；其他 → 直接套用对应规则
-    force_choice = st.selectbox(
-        "🎬 这段视频的动作类型（可手动指定以提升识别准确率）",
-        ["🤖 自动分类", "🏸 高远球", "💥 杀球", "🎯 吊球", "⤴️ 挑球", "🎾 搓球/放网", "🌀 头顶球"],
-        key="force_action_choice",
-        help="勾选自动分类让系统智能识别；若识别有误，可手动指定动作类型（推荐演示时使用）",
-    )
-    force_map = {"🏸 高远球": "clear", "💥 杀球": "smash", "🎯 吊球": "drop", "⤴️ 挑球": "lift",
-                 "🎾 搓球/放网": "net", "🌀 头顶球": "around_head"}
-    force_action = force_map.get(force_choice, None)
-
     data = load_video_bytes("solo", "上传学员视频")
     if data and st.button("🚀 开始分析", key="btn_solo"):
         with st.spinner("正在逐帧姿态估计与动作分割……"):
-            a = analyze_video(data, label="solo", force_action=force_action)
+            a = analyze_video(data, label="solo")
         if a is None:
             st.error("未能检测到人体关键点，请确认视频中人物全身清晰、光线充足。")
         else:
@@ -1150,20 +1439,175 @@ with tab3:
                            % ACTION_PROFILES[act_sel]["name"])
                 st.rerun()
 
-# ============ Tab4：系统说明 ============
+# ============ Tab4：球轨迹分析（v5 新增） ============
 with tab4:
+    st.markdown(
+        "上传比赛或训练视频，系统用 **双检测引擎**逐帧定位羽毛球并绘制飞行轨迹、估算球速、标记高速击球时刻："
+        "**YOLOv8**（通用目标检测，速度快）与 **TrackNetV2**（羽毛球追踪专用网络，对高速小目标更敏感）。"
+        "先选择拍摄机位（两种机位的轨迹形态不同，检测参数与展示内容也不同）。"
+    )
+    yolo_ready = load_shuttle_model() is not None
+    if not yolo_ready:
+        st.warning(
+            "未找到 YOLOv8 权重文件 `shuttle_best.pt`，**YOLO 引擎暂不可用**；请改用 TrackNetV2 引擎"
+            "（首次使用时会自动下载约 43MB 权重，无需手动上传）。如需恢复 YOLO 引擎，请把 shuttle_best.pt "
+            "上传到 GitHub 仓库根目录（与 app.py 同级），Streamlit Cloud 自动重新部署后生效。"
+        )
+    cA, cB, cC = st.columns([1, 1, 1])
+    with cA:
+        cam_label = st.radio(
+            "📷 拍摄机位", ["↔ 侧面机位", "◎ 正后方机位"], key="cam_sel",
+            help="侧面机位：能看到球的抛物线弧度，侧重轨迹形状、球速与击球点高度；\n"
+                 "正后方机位：从底线后拍摄，侧重球的落点在左/中/右半场的分布。")
+        engines = (["⚡ YOLOv8（快）", "🎯 TrackNetV2（羽毛球专用）"] if yolo_ready
+                   else ["🎯 TrackNetV2（羽毛球专用）"])
+        engine_label = st.radio(
+            "🧠 检测引擎", engines, key="engine_sel",
+            help="YOLOv8：通用目标检测，速度快（约 3~5 倍）；\n"
+                 "TrackNetV2：羽毛球追踪专用网络（连续 3 帧运动信息 + 热图定位），"
+                 "对高速小目标更敏感，首次使用自动下载权重，CPU 分析更慢，建议分析时长 ≤ 10 秒。")
+    with cB:
+        if engine_label.startswith("⚡"):
+            conf = st.slider("检测置信度阈值", 0.05, 0.50, 0.20, 0.05, key="shuttle_conf",
+                             help="阈值越低越容易检出（但误检变多）。正后方机位球更小更远，建议 0.10~0.15。")
+        else:
+            conf = st.slider("热图峰值阈值", 0.03, 0.50, 0.06, 0.01, key="shuttle_conf_tn",
+                             help="TrackNetV2 输出球位置热图，峰值超过该阈值才算检出球。"
+                                  "该引擎热图响应较温和（飞行中球的峰值约 0.05~0.5），漏检多就调低，误检多就调高。")
+        max_seconds = st.select_slider("分析时长上限（秒）", [5, 8, 10, 15, 20, 30],
+                                       value=15, key="shuttle_len",
+                                       help="云服务器为 CPU 分析，时间越长耗时越久。建议先取击球最密集的片段。")
+    with cC:
+        st.markdown('<span class="hint">**拍摄建议**</span>\n'
+                    '- 手机横屏、固定机位（三脚架或倚靠物）\n'
+                    '- 画面涵盖球的完整飞行路线\n'
+                    '- 光线充足，避免逆光\n'
+                    '- 正后方机位尽量站高（球网不遮挡落点）',
+                    unsafe_allow_html=True)
+
+    data = load_video_bytes("shuttle", "上传球轨迹分析视频")
+    if data and st.button("🚀 开始轨迹分析", key="btn_shuttle"):
+        cam = "side" if cam_label.startswith("↔") else "back"
+        is_tn = engine_label.startswith("🎯")
+        if cam == "back" and not is_tn and conf > 0.2:
+            st.toast("正后方机位建议把置信度降到 0.10~0.15，否则远端小球可能漏检。")
+        if is_tn:
+            with st.spinner("TrackNetV2 逐帧追踪羽毛球（CPU 分析较慢，约 2~8 分钟，请耐心等待）……"):
+                r = analyze_shuttle_video_tracknet(data, camera=cam, thresh=conf, max_seconds=min(max_seconds, 12))
+        else:
+            with st.spinner("YOLO 逐帧检测羽毛球（CPU 分析约 30~90 秒，请稍候）……"):
+                r = analyze_shuttle_video(data, camera=cam, conf=conf, step=2, max_seconds=max_seconds)
+        if r is None:
+            if is_tn:
+                st.error("球检出过少，无法绘制轨迹。请确认画面中羽毛球清晰可见、光线充足，或降低热图判定阈值后重试。"
+                         "若提示权重下载失败，多为网络波动，重新点击按钮即可自动续传。")
+            else:
+                st.error("球检出过少，无法绘制轨迹。建议：① 降低阈值；② 确认画面中球清晰可见；③ 换用更近的机位；④ TrackNetV2 引擎对比赛/训练视频更敏感，可切换尝试。")
+        else:
+            st.session_state["shuttle_result"] = r
+            st.session_state["shuttle_engine"] = engine_label
+
+    if "shuttle_result" in st.session_state:
+        r = st.session_state["shuttle_result"]
+        is_back = r["camera"] == "back"
+        eng_badge = ("🎯 TrackNetV2" if st.session_state.get("shuttle_engine", "").startswith("🎯")
+                     else "⚡ YOLOv8")
+
+        # —— 汇总指标 ——
+        st.markdown("### 📋 轨迹分析结果（%s · %s）"
+                    % ("正后方机位" if is_back else "侧面机位", eng_badge))
+        cols = st.columns(5)
+        cards = [
+            ("球检出率", "%d%%" % (r["detect_rate"] * 100)),
+            ("轨迹点数", "%d" % len(r["pts"])),
+            ("最大画面球速", "%.0f px/s" % r["max_speed"]),
+            ("高速击球次数", "%d" % len(r["hits"])),
+            ("分析时长", "%.1f s" % (r["n_sampled"] * r["dt"])),
+        ]
+        for c, (lab, val) in zip(cols, cards):
+            c.metric(lab, val)
+        st.caption("球检出率 = 检出球的采样帧 / 总采样帧。低于 40% 时轨迹可能断续，建议降低置信度阈值或改善拍摄。"
+                   "球速为画面像素速度（未做真实距离标定），用于同机位下不同视频的相对比较。")
+
+        # —— 机位专属分析 ——
+        if is_back:
+            lands, cnt = shuttle_landing_zones(r)
+            st.subheader("🎯 落点分布（正后方机位）")
+            lc = st.columns(3)
+            for c, (k, lab) in zip(lc, [("left", "↖ 左半场"), ("mid", "↑ 中路"), ("right", "↗ 右半场")]):
+                c.metric(lab, "%d 球" % cnt[k])
+            if lands:
+                st.caption("按高速击球时刻切分飞行段，段末（球速骤减处）视为落点，依据画面横向位置归类。"
+                           "落点明显偏一侧时，注意对手是否已摸清你的线路习惯。")
+            else:
+                st.caption("本段未检测到完整飞行段（球检出断续或时长过短），可尝试延长分析时长。")
+        else:
+            hh = shuttle_hit_heights(r)
+            st.subheader("📈 击球点高度（侧面机位）")
+            if hh:
+                hcols = st.columns(min(len(hh), 5))
+                for c, (k, (si_, y, v, tag)) in enumerate(zip(hcols, hh)):
+                    c.metric("第 %d 次高速击球" % (k + 1), "画面 %.0f%%" % (y * 100), tag)
+                st.caption("击球点越高（占比越小），越容易借力下压。数值基于画面纵向位置估算，同一机位下可横向比较。")
+            else:
+                st.caption("本段未检测到明显的高速击球（可能为平抽/挑球等匀速飞行），可降低置信度后重试。")
+
+        # —— 轨迹帧浏览 ——
+        st.subheader("🎬 飞行轨迹回放")
+        st.caption("每帧叠加球的历史轨迹（黄绿→红表示由远及近）与当前球位置（红点 + 检测置信度）。")
+        first_hit = r["hits"][0][0] if r["hits"] else None
+        show_frame_browser(r["jpgs"], first_hit, "shuttle")
+
+        # —— 球速曲线 ——
+        cL, cR = st.columns([3, 2])
+        with cL:
+            st.subheader("球速-时间曲线")
+            sdf = speed_chart_df(r)
+            if len(sdf) > 1:
+                st.line_chart(sdf.set_index("时间 (s)"), height=280)
+                for si_, _ in r["hits"]:
+                    st.caption("⭐ 视频第 %.1f 秒检测到一次高速击球（速度峰值）" % (si_ * r["dt"]))
+            else:
+                st.caption("轨迹点过少，无法绘制球速曲线。")
+        with cR:
+            st.subheader("本段数据")
+            if st.button("📥 下载轨迹数据 CSV", key="dl_shuttle"):
+                ddf = pd.DataFrame(r["pts"], columns=["采样帧", "x(归一化)", "y(归一化)", "置信度"])
+                st.download_button("点击保存", ddf.to_csv(index=False).encode("utf-8-sig"),
+                                   "shuttle_trajectory.csv", "text/csv", key="dl_shuttle2")
+            st.caption("CSV 含每帧球位置与置信度，可用于论文图表绘制或二次分析。")
+
+# ============ Tab5：系统说明 ============
+with tab5:
     st.markdown(
         """
 #### 技术架构
 - **姿态估计**：MediaPipe Pose（33 个身体关键点，含置信度滤波与平滑）
 - **六关节动力链**：肘、肩、腕、髋、膝、踝——覆盖「踝蹬转 → 膝蹬伸 → 髋转体 → 肩挥臂 → 肘鞭打 → 腕控拍」完整发力链
 - **动作分割**：基于手腕垂直速度多峰检测，自动切分视频中的每一次击球（最多 6 拍）
-- **动作识别**：基于运动学特征（击球点高度、挥拍角速度、动作时长、击球前后手腕轨迹）的多特征加权投票分类，支持高远球/杀球/吊球/挑球/搓球放网/头顶球六类；另提供手动指定动作类型（v4.2），识别不确定时用户可强制指定
+- **动作识别**：基于运动学特征（击球点高度、挥拍角速度、击球前后手腕轨迹）的决策树分类，支持高远球/杀球/吊球/挑球四类
 - **评分引擎（双基准）**：
   - 有标准模板 → **六关节加权 DTW 模板匹配**（z-score 归一化后比曲线形状，按动力链环节逐段诊断）
   - 无标准模板 → 运动生物力学**常模规则库**（肘部伸展、转体幅度、挥速、击球点高度、随挥轨迹）
 - **标准模板来源（两种）**：① 标准动作视频分析后一键保存；② 直接导入关节角度数据（CSV，六关节任意组合，支持中英文列名）
 - **交互界面**：Streamlit 单页应用，支持逐拍清单、逐帧回放、六关节曲线勾选与标准库管理
+
+#### 球轨迹分析（v5 新增，v5.1 升级双引擎）
+- **⚡ YOLOv8 引擎（快速）**：YOLOv8n 单类别（Shuttlecock）目标检测，300 万参数，CPU 可实时推理；
+  权重训练于 3,067 张专业赛事 + 业余比赛标注图像（公开数据集），测试集 mAP@50 ≈ 76%
+- **🎯 TrackNetV2 引擎（精度）**：羽毛球追踪专用网络（NTHU, TrackNetV2 论文），连续 3 帧 RGB 堆叠为
+  9 通道输入，UNet+VGG16 结构输出 3 张热图取峰值定位；利用帧间运动信息，对高速小目标更敏感。
+  权重来自官方 TensorFlow 权重的开源转换（ChgygLin/TrackNetV2-pytorch），首次使用自动下载（约 43MB）；
+  纯 CPU 推理较慢（约 2~8 分钟），建议分析时长 ≤ 10 秒
+- **分析流程**（两引擎共用后处理）：视频采样 → 逐帧定位球位置 → 短缺口线性插值补全轨迹 →
+  滑窗中值滤波去噪 → 帧间位移 ÷ 时间差估算画面球速 → 速度局部峰值检测高速击球时刻
+- **双机位模式**：侧面机位侧重抛物线轨迹、球速与击球点高度；
+  正后方机位侧重落点的左/中/右半场分布
+- **方法参考**：Zhao, J. et al. Design and Development of a Public AI Referee Assistance System
+  Based on Harmony OS Platform. *Sensors* 2025, 25, 2127（YOLO 目标检测 + MediaPipe 姿态识别的
+  AI 裁判系统；本系统采用相同技术路线，姿态分析用于动作教学，球检测用于轨迹与落点分析）；
+  TrackNetV2: Efficient Shuttlecock Tracking Network（Sun et al., NTHU）
+- **已知边界**：画面球速未做真实距离标定，仅支持同机位相对比较；强逆光、球被身体完全遮挡或贴网静止时可能漏检
 
 #### 六关节与 DTW 权重
 | 关节 | 权重 | 生物力学意义 |
@@ -1187,15 +1631,13 @@ with tab4:
 这样设计的理由：动作节奏因人而异可以宽容，但关节角度脱离标准（如膝角差 45°）就是实打实的
 技术问题——两者必须分开评价，诊断建议也会区分"时序问题"和"幅度问题"。
 
-#### 六种动作的识别逻辑
+#### 四种动作的识别逻辑
 | 动作 | 关键特征 |
 |---|---|
 | 杀球 | 击球点远高于肩 + 挥拍角速度极快（≥420°/s）|
 | 挑球 | 击球后手腕持续上升（下手位向上发力）|
 | 吊球 | 挥拍角速度慢（<260°/s，减力切削）|
 | 高远球 | 完整鞭打动作：挥速快 + 击球后随挥下落 |
-| 搓球/放网 | 挥速极慢（<160°/s）+ 击球点低位（网前轻技术，出手近水平）|
-| 头顶球 | 高位击球 + 中等挥速（280–420°/s）+ 片段偏长（绕头顶被动过渡）|
 
 #### 使用建议
 - 视频要求：侧面机位（持拍侧朝镜头）、全身入镜、光线充足
@@ -1204,6 +1646,11 @@ with tab4:
 - 对比模式：标准视频建议选取教练或专业运动员的**同类**动作
 
 #### 版本
+- v5.1：球轨迹分析升级双引擎——新增 TrackNetV2 羽毛球追踪专用网络（连续 3 帧运动信息 + 热图定位，
+        借鉴 ChgygLin/TrackNetV2-pytorch 开源实现与官方转换权重），首次使用自动下载权重；
+        YOLOv8 引擎保留为快速选项，两引擎共用轨迹后处理与结果展示
+- v5.0：球轨迹分析——YOLOv8 羽毛球检测、飞行轨迹绘制、画面球速估算、高速击球时刻标记、
+        侧面/正后方双机位模式、轨迹数据 CSV 导出
 - v4.0：六关节动力链分析——特征扩展到肘/肩/腕/髋/膝/踝；骨架图标注多关节实时角度；曲线可勾选关节；
         模板匹配升级为六关节加权 DTW；诊断报告按动力链环节（下肢→转体→挥臂→手腕）逐段反馈
 - v3.0：动作标准库——标准视频一键建模板 / CSV 角度数据导入；评分引擎升级为 DTW 模板匹配
