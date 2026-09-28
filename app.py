@@ -348,7 +348,6 @@ LBL_COLOR = {"elbow": (0, 0, 255), "shoulder": (255, 0, 0), "wrist": (0, 160, 25
 
 
 def draw_annotated(frame_bgr, landmarks, angles, side="right"):
-
     """画骨骼 + 多关节角度数字（角度：{关节key: 度数}）"""
     mp_drawing.draw_landmarks(
         frame_bgr, landmarks, mp_pose.POSE_CONNECTIONS,
@@ -699,7 +698,6 @@ def show_metrics(a, score=None):
 
 def eval_segment(seg, action):
     """统一评分入口：有该动作的标准模板 → DTW 模板匹配；无 → 常模规则。
-
     返回 (总分, 反馈列表, 评价模式, 模板名, 各关节相似度)"""
     tpl_map = load_templates()
     tpl = tpl_map.get(action)
@@ -1049,7 +1047,8 @@ def _shuttle_heatmap_center(heatmap, thresh):
 def analyze_shuttle_video_tracknet(video_bytes, camera="side", thresh=0.5, max_seconds=8):
     """TrackNetV2 引擎：连续 3 帧 RGB 堆叠推理（步长 3，不重叠），热图质心定位球。
     输出结构与 YOLO 引擎一致，共用轨迹后处理。"""
-          return None
+    if not ensure_tracknet_weights():
+        return None
     import torch
     import torchvision
     model = load_tracknet_model()
@@ -1137,6 +1136,7 @@ def shuttle_landing_zones(r):
     for _, x in lands:
         cnt["left" if x < 0.4 else ("right" if x > 0.6 else "mid")] += 1
     return lands, cnt
+
 
 def shuttle_hit_heights(r):
     """侧面机位：各高速击球时刻的击球点高度（y_norm，越小越高）与文字评价。"""
