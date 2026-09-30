@@ -736,6 +736,10 @@ SHUTTLE_FRAME_W = 640   # 分析统一缩放到的画面宽度（像素）
 TRAIL_LEN = 22          # 轨迹拖尾长度（采样帧数）
 SHUTTLE_MAX_JPGS = 220  # 最多缓存的轨迹标注帧（控制内存）
 
+# v5.2 球拍检测（自训练 YOLOv8n，权重 racket_best.pt 由本地标注数据训练得到）
+RACKET_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "racket_best.pt")
+RACKET_CONF = 0.25      # 球拍检测置信度阈值
+
 
 @st.cache_resource(show_spinner="正在加载羽毛球检测模型……")
 def load_shuttle_model():
@@ -750,6 +754,16 @@ def load_shuttle_model():
     except Exception:
         pass
     return YOLO(SHUTTLE_WEIGHTS)
+
+
+@st.cache_resource(show_spinner="正在加载球拍检测模型……")
+def load_racket_model():
+    """懒加载 v5.2 球拍检测权重（racket_best.pt）。权重缺失返回 None，
+    此时球轨迹分析照常工作，只是不再叠加球拍框。"""
+    if not os.path.exists(RACKET_WEIGHTS):
+        return None
+    from ultralytics import YOLO
+    return YOLO(RACKET_WEIGHTS)
 
 
 def _draw_trail(vis, pts, tail=TRAIL_LEN):
@@ -771,13 +785,17 @@ def _draw_trail(vis, pts, tail=TRAIL_LEN):
         cv2.circle(vis, (int(seg[-1][0]), int(seg[-1][1])), 5, (0, 0, 255), -1, cv2.LINE_AA)
 
 
-def analyze_shuttle_video(video_bytes, camera="side", conf=0.20, step=2, max_seconds=12):
+def analyze_shuttle_video(video_bytes, camera="side", conf=0.20, step=2, max_seconds=12,
+                          detect_racket=True):
     """YOLO 逐帧检测羽毛球 → 轨迹 → 球速。camera: "side"（侧面）| "back"（正后方）。
+    detect_racket: 是否同时用 racket_best.pt 在画面上叠加球拍框（v5.2）。
     返回 dict：jpgs(轨迹标注帧) pts(轨迹点) speeds(球速序列) hits(高速击球时刻) 等；
     球检出过少时返回 None。"""
     model = load_shuttle_model()
     if model is None:
         return None
+    racket_model = load_racket_model() if detect_racket else None
+    n_racket = 0        # 检出球拍的采样帧数（v5.2）
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
         tmp = f.name
@@ -813,6 +831,18 @@ def analyze_shuttle_video(video_bytes, camera="side", conf=0.20, step=2, max_sec
             vis = frame.copy()
             valid = [p for p in trail if p]
             _draw_trail(vis, valid)
+            # —— v5.2 球拍检测：绿框标出球拍位置，并累计检出帧数 ——
+            if racket_model is not None:
+                rres = racket_model.predict(frame, imgsz=640, conf=RACKET_CONF, verbose=False)[0]
+                if len(rres.boxes):
+                    rb = max(rres.boxes, key=lambda bb: float(bb.conf))
+                    rx1, ry1, rx2, ry2 = [float(v) for v in rb.xyxy[0]]
+                    n_racket += 1
+                    cv2.rectangle(vis, (int(rx1), int(ry1)), (int(rx2), int(ry2)),
+                                  (0, 255, 0), 2)
+                    cv2.putText(vis, "racket %.2f" % float(rb.conf),
+                                (int(rx1), max(14, int(ry1) - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
             if len(res.boxes):
                 cv2.circle(vis, (int(trail[-1][0]), int(trail[-1][1])), 12, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(vis, "shuttle %.2f" % c, (int(trail[-1][0]) + 14, int(trail[-1][1]) - 10),
@@ -825,7 +855,12 @@ def analyze_shuttle_video(video_bytes, camera="side", conf=0.20, step=2, max_sec
         idx += 1
     cap.release()
     os.unlink(tmp)
-    return _shuttle_postprocess(raw_pts, jpgs, fps, dt, step, si, idx, camera, max_raw)
+    out = _shuttle_postprocess(raw_pts, jpgs, fps, dt, step, si, idx, camera, max_raw)
+    if out is not None:      # v5.2：附带球拍检出统计（模型缺失时为 0）
+        out["n_racket"] = n_racket
+        out["racket_rate"] = n_racket / max(1, si)
+        out["racket_on"] = racket_model is not None
+    return out
 
 
 def _shuttle_postprocess(raw_pts, jpgs, fps, dt, step, si, idx, camera, max_raw):
@@ -1477,6 +1512,16 @@ with tab4:
         max_seconds = st.select_slider("分析时长上限（秒）", [5, 8, 10, 15, 20, 30],
                                        value=15, key="shuttle_len",
                                        help="云服务器为 CPU 分析，时间越长耗时越久。建议先取击球最密集的片段。")
+        # v5.2：球拍检测开关（权重缺失时自动关闭并提示）
+        racket_ready = load_racket_model() is not None
+        if racket_ready:
+            racket_on = st.checkbox("🏸 同时检测球拍", value=True, key="racket_on",
+                                    help="用自训练的 YOLOv8n 模型在每帧标出球拍位置（绿色框）。"
+                                         "关闭可让分析更快（约省一半时间）。")
+        else:
+            racket_on = False
+            st.caption("ℹ️ 未找到球拍权重 `racket_best.pt`，球拍检测未启用"
+                       "（如需启用，请把该文件上传到 GitHub 仓库根目录）。")
     with cC:
         st.markdown('<span class="hint">**拍摄建议**</span>\n'
                     '- 手机横屏、固定机位（三脚架或倚靠物）\n'
@@ -1496,7 +1541,8 @@ with tab4:
                 r = analyze_shuttle_video_tracknet(data, camera=cam, thresh=conf, max_seconds=min(max_seconds, 12))
         else:
             with st.spinner("YOLO 逐帧检测羽毛球（CPU 分析约 30~90 秒，请稍候）……"):
-                r = analyze_shuttle_video(data, camera=cam, conf=conf, step=2, max_seconds=max_seconds)
+                r = analyze_shuttle_video(data, camera=cam, conf=conf, step=2, max_seconds=max_seconds,
+                                          detect_racket=racket_on)
         if r is None:
             if is_tn:
                 st.error("球检出过少，无法绘制轨迹。请确认画面中羽毛球清晰可见、光线充足，或降低热图判定阈值后重试。"
@@ -1528,6 +1574,16 @@ with tab4:
             c.metric(lab, val)
         st.caption("球检出率 = 检出球的采样帧 / 总采样帧。低于 40% 时轨迹可能断续，建议降低置信度阈值或改善拍摄。"
                    "球速为画面像素速度（未做真实距离标定），用于同机位下不同视频的相对比较。")
+        # v5.2：球拍检测统计
+        if r.get("racket_on"):
+            if r["n_racket"]:
+                st.info("🏸 **球拍检测**：%d / %d 个采样帧中检出球拍（检出率 %d%%），"
+                        "画面中已经用**绿色框**标出球拍位置。"
+                        % (r["n_racket"], r["n_sampled"], int(r["racket_rate"] * 100)))
+            else:
+                st.warning("🏸 本次分析中球拍模型未检出球拍。可能是：① 画面中球拍太小/被遮挡；"
+                           "② 训练数据偏少导致模型泛化不足。可尝试换更清晰的机位，"
+                           "或补充标注更多帧后重新训练 `racket_best.pt`。")
 
         # —— 机位专属分析 ——
         if is_back:
